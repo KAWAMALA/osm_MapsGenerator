@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OSM City Road Poster Generator</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+*{box-sizing:border-box}
+body{margin:0;padding:30px;background:#0b0b0b;color:white;font-family:Arial,sans-serif;text-align:center}
+.container{max-width:1200px;margin:auto}
+.controls{display:flex;justify-content:center;flex-wrap:wrap;gap:10px;margin-bottom:18px}
+input{width:320px}
+input,select,button{border:none;border-radius:10px;padding:14px;font-size:16px}
+button{background:#222;color:white;cursor:pointer;transition:.2s}
+button:hover{background:#444}
+button:disabled{opacity:.5;cursor:not-allowed}
+#status{min-height:24px;color:#a9a9a9;margin-bottom:12px;font-size:14px}
+#map-wrapper{background:#000;border-radius:18px;overflow:hidden;padding:25px}
+#map{height:720px;background:#000;border-radius:12px}
+.meta{margin-top:28px}
+h1{margin:20px 0 10px;font-size:58px;font-weight:700;letter-spacing:2px;text-transform:uppercase}
+.meta p{margin:4px 0;color:#cfcfcf;font-size:16px;letter-spacing:1px}
+.detail-row{display:flex;justify-content:center;gap:8px;margin-top:10px;flex-wrap:wrap}
+.detail-row label{color:#888;font-size:13px}
+.detail-row select{padding:6px 10px;font-size:13px;border-radius:8px;background:#1a1a1a;color:#fff;border:1px solid #333}
+</style>
+</head>
+<body>
+<div class="container">
+  <h2>OSM City Road Poster Generator</h2>
+
+  <div class="controls">
+    <input id="city" placeholder="Enter city e.g. Dar es Salaam" onkeydown="if(event.key==='Enter') generateMap()"/>
+    <select id="theme">
+      <option value="white">White Roads</option>
+      <option value="colorful">Colorful Roads</option>
+    </select>
+    <select id="detail">
+      <option value="fast">Fast (major roads)</option>
+      <option value="normal" selected>Normal (+ residential)</option>
+      <option value="full">Full (all roads)</option>
+    </select>
+    <button id="generateBtn" onclick="generateMap()">Generate Map</button>
+    <button onclick="downloadPNG()">Download PNG</button>
+  </div>
+
+  <div id="status"></div>
+
+  <div id="map-wrapper">
+    <div id="map"></div>
+    <div class="meta">
+      <h1 id="city-title">—</h1>
+      <p id="coords"></p>
+      <p id="country"></p>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script>
+
+/* ── Tile layer ── */
+const map = L.map('map', { zoomControl:true, attributionControl:false }).setView([0,0],2);
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png',
+  { subdomains:'abcd', maxZoom:19 }).addTo(map);
+
+let roadLayer = L.layerGroup().addTo(map);
+let abortCtrl = null;   // cancel previous fetch
+
+/* Road sets by detail level */
+const ROAD_SETS = {
+  fast:   'motorway|trunk|primary|secondary',
+  normal: 'motorway|trunk|primary|secondary|tertiary|residential|unclassified',
+  full:   'motorway|trunk|primary|secondary|tertiary|residential|unclassified|living_street|pedestrian|service'
+};
+
+/* Bounding box clamp by detail level */
+const BOX_CLAMP = { fast: 0.45, normal: 0.22, full: 0.14 };
+
+const colorful = {
+  motorway:'#ff4d4d', trunk:'#ffa500', primary:'#ffff66',
+  secondary:'#66ccff', tertiary:'#66ff99', residential:'#ffffff',
+  unclassified:'#cccccc', living_street:'#aaffdd',
+  pedestrian:'#ffccff', service:'#777777'
+};
+const weights = {
+  motorway:3.5, trunk:3, primary:2.6, secondary:2,
+  tertiary:1.7, residential:1.1, unclassified:1,
+  living_street:.9, pedestrian:.9, service:.7
+};
+
+const generateBtn = document.getElementById('generateBtn');
+
+function setStatus(msg) { document.getElementById('status').textContent = msg; }
+function resetButton()  { generateBtn.disabled=false; generateBtn.textContent='Generate Map'; }
+
+async function generateMap() {
+  const city   = document.getElementById('city').value.trim();
+  const theme  = document.getElementById('theme').value;
+  const detail = document.getElementById('detail').value;
+  if (!city) { alert('Enter a city name'); return; }
+
+  /* Cancel any running request */
+  if (abortCtrl) { abortCtrl.abort(); }
+  abortCtrl = new AbortController();
+  const signal = abortCtrl.signal;
+
+  generateBtn.disabled = true;
+  generateBtn.textContent = 'Loading…';
+  roadLayer.clearLayers();
+
+  try {
+    /* ── 1. Geocode ── */
+    setStatus('Searching city…');
+    const geoRes = await fetch(
+      `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(city)}&format=jsonv2&limit=1&addressdetails=1`,
+      { headers:{'Accept-Language':'en'}, signal }
+    );
+    const geo = await geoRes.json();
+    if (!geo.length) { setStatus('City not found.'); resetButton(); return; }
+
+    const place    = geo[0];
+    const lat      = parseFloat(place.lat);
+    const lon      = parseFloat(place.lon);
+    const country  = place.address?.country || place.display_name.split(',').slice(-1)[0].trim();
+    const cityName = place.address?.city || place.address?.town || place.address?.village || city;
+
+    document.getElementById('city-title').textContent = cityName;
+    document.getElementById('coords').textContent     = `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+    document.getElementById('country').textContent    = country;
+
+    /* ── 2. Clamp bounding box ── */
+    let [s, n, w, e] = place.boundingbox.map(Number);
+    const MAX = BOX_CLAMP[detail];
+    if (n - s > MAX) { const m=(n+s)/2; s=m-MAX/2; n=m+MAX/2; }
+    if (e - w > MAX) { const m=(e+w)/2; w=m-MAX/2; e=m+MAX/2; }
+    map.fitBounds([[s,w],[n,e]]);
+
+    /* ── 3. Overpass — out skel qt = no tags, sorted; much smaller payload ── */
+    setStatus('Fetching road data…');
+    const roads = ROAD_SETS[detail];
+
+    /* For "fast" we skip tags (out skel qt), for others we need highway tag → out geom */
+    const needTags = (theme === 'colorful' || detail !== 'fast');
+    const outClause = needTags ? 'out geom qt;' : 'out skel qt;';
+
+    const query = `[out:json][timeout:25];
+way["highway"~"${roads}"](${s},${w},${n},${e});
+${outClause}`;
+
+    const t0  = Date.now();
+    const res = await fetch('https://overpass-api.de/api/interpreter', {
+      method:'POST',
+      body:'data=' + encodeURIComponent(query),
+      signal
+    });
+    const data = await res.json();
+    const elapsed = ((Date.now() - t0)/1000).toFixed(1);
+
+    if (!data.elements?.length) { setStatus('No roads found.'); resetButton(); return; }
+
+    /* ── 4. Render ── */
+    data.elements.forEach(el => {
+      if (!el.geometry) return;
+      const coords = el.geometry.map(p => [p.lat, p.lon]);
+      const road   = el.tags?.highway || 'unclassified';
+      const color  = theme==='colorful' ? (colorful[road]||'#aaaaaa') : '#ffffff';
+      const weight = weights[road] || 1;
+      L.polyline(coords, { color, weight, opacity:.92 }).addTo(roadLayer);
+    });
+
+    const layers = roadLayer.getLayers();
+    if (layers.length) {
+      map.fitBounds(roadLayer.getBounds(), { padding:[40,40] });
+    }
+
+    setStatus(`✓ ${data.elements.length.toLocaleString()} roads drawn in ${elapsed}s.`);
+
+  } catch(err) {
+    if (err.name === 'AbortError') { setStatus('Cancelled.'); }
+    else { setStatus('Error: ' + err.message); }
+  }
+
+  resetButton();
+}
+
+async function downloadPNG() {
+  setStatus('Rendering PNG…');
+  const canvas = await html2canvas(document.getElementById('map-wrapper'), {
+    backgroundColor:'#000', useCORS:true, scale:3
+  });
+  const a = document.createElement('a');
+  a.download = 'city-road-map.png';
+  a.href = canvas.toDataURL('image/png');
+  a.click();
+  setStatus('');
+}
+</script>
+</body>
+</html>
